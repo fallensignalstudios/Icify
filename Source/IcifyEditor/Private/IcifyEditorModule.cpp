@@ -37,7 +37,7 @@ namespace
 		DryRun
 	};
 
-	void Notify(const FText& Message, bool bError = false)
+	void NotifyUser(const FText& Message, bool bError = false)
 	{
 		FNotificationInfo Info(Message);
 		Info.ExpireDuration = bError ? 8.f : 4.f;
@@ -64,7 +64,7 @@ namespace
 		}
 		if (Zones.Num() == 0)
 		{
-			Notify(LOCTEXT("NoZones", "No Icify freeze zones in this level."));
+			NotifyUser(LOCTEXT("NoZones", "No Icify freeze zones in this level."));
 			return;
 		}
 
@@ -83,7 +83,7 @@ namespace
 			Icicles += Zone->GetLastReport().IcicleStats.Icicles;
 		}
 		const bool bReports = Action == EZoneAction::Preview || Action == EZoneAction::Apply || Action == EZoneAction::DryRun;
-		Notify(bReports
+		NotifyUser(bReports
 			? FText::Format(LOCTEXT("ZonesDone", "Icify: processed {0} zone(s), {1} icicle(s). Reports are in Saved/Icify/Reports."), Zones.Num(), Icicles)
 			: FText::Format(LOCTEXT("ZonesDoneNoReport", "Icify: processed {0} zone(s)."), Zones.Num()));
 	}
@@ -93,16 +93,16 @@ namespace
 		const FIcifyContentReport Report = FIcifyContentBuilder::Run(bForce);
 		if (Report.HasErrors())
 		{
-			Notify(FText::Format(LOCTEXT("ContentErrors", "Icify content build had {0} error(s). See the Output Log or Saved/Icify/ContentReport.txt."),
+			NotifyUser(FText::Format(LOCTEXT("ContentErrors", "Icify content build had {0} error(s). See the Output Log or Saved/Icify/ContentReport.txt."),
 				Report.Errors.Num() + (Report.bSaved ? 0 : 1)), true);
 		}
 		else if (Report.Created.Num() + Report.Rebuilt.Num() > 0)
 		{
-			Notify(FText::Format(LOCTEXT("ContentBuilt", "Icify: created {0}, rebuilt {1} asset(s); connections, compile and save OK."), Report.Created.Num(), Report.Rebuilt.Num()));
+			NotifyUser(FText::Format(LOCTEXT("ContentBuilt", "Icify: created {0}, rebuilt {1} asset(s); connections, compile and save OK."), Report.Created.Num(), Report.Rebuilt.Num()));
 		}
 		else
 		{
-			Notify(LOCTEXT("ContentCurrent", "Icify: plugin content is up to date."));
+			NotifyUser(LOCTEXT("ContentCurrent", "Icify: plugin content is up to date."));
 		}
 	}
 
@@ -111,7 +111,7 @@ namespace
 		FString Message;
 		const bool bOk = FIcifyLibraryBuilder::Build(bOverwrite, Message);
 		UE_LOG(LogIcify, Log, TEXT("%s"), *Message);
-		Notify(FText::FromString(TEXT("Icify: ") + Message), !bOk);
+		NotifyUser(FText::FromString(TEXT("Icify: ") + Message), !bOk);
 	}
 }
 
@@ -322,11 +322,11 @@ private:
 		}
 		if (NumDiscarded > 0)
 		{
-			Notify(FText::Format(LOCTEXT("PreviewDiscarded", "Icify: discarded {0} preview(s) before saving. Apply to keep the ice, or Preview again."), NumDiscarded));
+			NotifyUser(FText::Format(LOCTEXT("PreviewDiscarded", "Icify: discarded {0} preview(s) before saving. Apply to keep the ice, or Preview again."), NumDiscarded));
 		}
 		if (NumRetained > 0)
 		{
-			Notify(FText::Format(LOCTEXT("PreviewRestoreFailed", "Icify: could not restore {0} preview(s). Their original backups were retained; see the Output Log and repair the changed meshes before trying again."), NumRetained), true);
+			NotifyUser(FText::Format(LOCTEXT("PreviewRestoreFailed", "Icify: could not restore {0} preview(s). Their original backups were retained; see the Output Log and repair the changed meshes before trying again."), NumRetained), true);
 		}
 	}
 
@@ -347,7 +347,7 @@ private:
 		if (Name == GET_MEMBER_NAME_CHECKED(UIcifySettings, CustomPrimitiveDataIndex) || Name == GET_MEMBER_NAME_CHECKED(UIcifySettings, MaskUVChannel))
 		{
 			RunContentBuild(/*bForce*/ false);
-			Notify(LOCTEXT("ReapplyZones", "Icify: material content updated. Clear and re-apply existing freeze zones so meshes use the new settings."));
+			NotifyUser(LOCTEXT("ReapplyZones", "Icify: material content updated. Clear and re-apply existing freeze zones so meshes use the new settings."));
 		}
 	}
 

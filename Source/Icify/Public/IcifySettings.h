@@ -64,6 +64,13 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Classification")
 	TArray<FString> GlassKeywords;
 
+	/**
+	 * The parts of a window that aren't its glass ("WindowSill", a "Frame" slot). Once a slot's material, slot name or
+	 * mesh name matches one, glass keywords stop applying to that slot.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Classification")
+	TArray<FString> NotGlassKeywords;
+
 	/** Actors named like this are meltwater sources (see Drip Tag). */
 	UPROPERTY(config, EditAnywhere, Category = "Classification")
 	TArray<FString> DripKeywords;

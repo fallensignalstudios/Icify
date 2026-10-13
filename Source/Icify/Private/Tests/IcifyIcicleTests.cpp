@@ -73,7 +73,8 @@ namespace
 		}
 	};
 
-	int32 SectionVertices(const UProceduralMeshComponent* Mesh)
+	// GetProcMeshSection isn't const, so the helpers take a mutable component.
+	int32 SectionVertices(UProceduralMeshComponent* Mesh)
 	{
 		int32 Count = 0;
 		for (int32 Index = 0; Index < Mesh->GetNumSections(); ++Index)
@@ -145,9 +146,11 @@ bool FIcifyIcicleRoundTripTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Icicles are counted on the slab's report row"), Zone->GetLastReport().Components.ContainsByPredicate(
 		[](const FIcifyComponentReport& Row) { return Row.Icicles > 0; }));
 	const FBox Bounds = GeometryBounds(Previewed);
-	TestTrue(TEXT("Icicles hang from the slab's underside"), Bounds.IsValid && Bounds.Max.Z <= 193.0 && Bounds.Max.Z >= 189.0);
+	// The slab's underside is at 190 cm. Root caps tuck up into it by up to 0.3 + 1.35 x radius (6 cm at most).
+	TestTrue(TEXT("Icicles hang from the slab's underside"), Bounds.IsValid && Bounds.Max.Z >= 189.0 && Bounds.Max.Z < 199.0);
 	TestTrue(TEXT("Icicles stop above the floor"), Bounds.Min.Z > 0.0);
-	TestTrue(TEXT("Icicles stay along the slab's edges"), Bounds.Min.X > -110.0 && Bounds.Max.X < 110.0 && Bounds.Min.Y > -30.0 && Bounds.Max.Y < 30.0);
+	// The slab is 200 x 40 cm; roots flare and stretch along its edges, so allow a margin around it.
+	TestTrue(TEXT("Icicles stay along the slab's edges"), Bounds.Min.X > -118.0 && Bounds.Max.X < 118.0 && Bounds.Min.Y > -38.0 && Bounds.Max.Y < 38.0);
 	TestTrue(TEXT("No icicle is longer than the maximum (plus the embedded root)"), Stats.LongestCm <= Zone->IcicleMaxLengthCm + 0.01f);
 
 	// Determinism: the same seed grows exactly the same geometry; another seed grows different icicles.

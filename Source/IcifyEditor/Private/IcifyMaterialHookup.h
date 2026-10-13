@@ -114,8 +114,17 @@ public:
 	/** The base materials used by these actors' static meshes that don't use Icify yet. */
 	static TArray<UMaterial*> FindUnhookedMaterialsOn(const TArray<AActor*>& Actors);
 
+	/**
+	 * The base materials these actors' static meshes use that don't use Icify and can't be hooked up in place, but whose
+	 * private copy could be: engine content, such as the basic shapes' material.
+	 */
+	static TArray<UMaterial*> FindCopyOnlyMaterialsOn(const TArray<AActor*>& Actors);
+
 	/** Whether Icify can be hooked into this base material (editable surface material, not Substrate or landscape). */
 	static bool CanHookUp(const UMaterial* Material);
+
+	/** Whether this material can't be edited in place (engine content) but a copy of it could take Icify. */
+	static bool NeedsPrivateCopy(const UMaterial* Material);
 
 	/** Hooks up each material (with a backup) behind a progress dialog, then reports the outcome like Hook Up Materials In Level. */
 	static void HookUpMaterials(const TArray<UMaterial*>& Materials);

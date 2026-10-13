@@ -40,13 +40,15 @@ same time.
    **Freeze with Icify**).
 3. If their materials don't use Icify yet, you'll be asked. **Yes** makes private copies of their master materials
    for just those actors, so nothing shared changes. **No** hooks up the shared masters themselves, each one backed up
-   first. Icicles grow either way, because they have their own material.
+   first. Engine materials (the basic shapes' `BasicShapeMaterial`, for one) can't be changed, so they always get
+   private copies. Icicles grow either way, because they have their own material.
 4. A zone fitted to the selection previews the result. Play with the settings in the Details panel; with **Live
    Preview** on, every change regenerates.
 5. Press **Apply** to keep it, or **Cancel Preview** to drop it. **Clear** puts everything back exactly as it was.
 
 To freeze a whole area instead, place `BP_FreezeZone` (or the native **Icify Freeze Zone**) from the Place Actors
-panel, scale its box over the area, and run **Tools > Icify > Hook Up Materials In Level** once.
+panel, scale its box over the area, and run **Tools > Icify > Hook Up Materials In Level** once. It can't change
+engine materials and tells you which ones it found; use Freeze Selected Actors on the actors using them.
 
 ---
 
@@ -118,8 +120,8 @@ root-to-tip and a per-icicle random into `M_IcifyIcicle`, a subsurface ice mater
 turns white where rimed. The icicles live in two procedural mesh components on the zone:
 
 - **Icicles**: the applied ones, saved with the level and rebuilt on every Apply.
-- **PreviewIcicles**: never saved. It is emptied before every save, and while a preview is up it stands in for the
-  applied icicles, which are hidden.
+- **PreviewIcicles**: never saved into the level. It is emptied before every save (an autosave keeps the whole preview
+  as a recovery copy), and while a preview is up it stands in for the applied icicles, which are hidden.
 
 Icicles stay put when you move the zone box; they belong to the meshes they hang from.
 
@@ -159,7 +161,9 @@ order:
 1. a slot rule;
 2. the tags `Icify.Stone` / `Icify.Metal` / `Icify.Glass` on the component or actor;
 3. the physical material, through **Physical Surface Map** in Project Settings;
-4. keywords in the material, mesh and actor names (`glass`, `window`, `metal`, `steel`, `pipe`, `brick`...);
+4. keywords in the material, slot, mesh and actor names (`glass`, `window`, `metal`, `steel`, `pipe`, `brick`...).
+   A window's frame or sill (**Not Glass Keywords**: `frame`, `sill`, `ledge`...) is never glass, even on a mesh
+   called `SM_Window`;
 5. the fallback type.
 
 The surface profile scales each layer: metal frosts and glazes sooner, and glass sheds snow and grows fern frost. The
@@ -179,8 +183,9 @@ report's Slot Details say what each slot was classified as and why.
   Detect Drip Sources**) anything tagged `Icify.Drip` or named like a gutter, downpipe or spout. Meltwater runs down
   from each into frozen drips and a puddle of black ice below. With **Trace Meltwater** it follows the real geometry:
   down walls, along ledges, over edges and into puddles. Drip edges on a melt-source mesh are always fed.
-- **Heat sources**: actors tagged `Icify.Heat`, actors named like a fire, heater, chimney or bonfire, **Heat Source
-  Actors**, and optionally point and spot lights. Everything within **Thaw Radius** melts, and further above than below,
+- **Heat sources**: actors tagged `Icify.Heat`, actors named like a bonfire, campfire, fireplace, brazier, heater or
+  chimney (not a bare `Fire`, which would catch fire hydrants and firewood: tag those fires `Icify.Heat`), **Heat
+  Source Actors**, and optionally point and spot lights. Everything within **Thaw Radius** melts, and further above than below,
   because heat rises. A ring of refrozen glaze forms around the thawed patch.
 
 ### Freeze stamps
@@ -242,6 +247,9 @@ It also creates `MI_Icify_Stone`, `_Metal` and `_Glass`, instances of the exampl
 - Preview, Apply and Clear are undoable, together with every mesh change and the icicles.
 - Previews are never saved. Saving a level discards them first (autosaves keep them) and tells you.
 - When World Partition unloads a zone, its preview is put back.
+- Apply rebuilds the icicles from the meshes it freezes in that run. A mesh in an unloaded cell keeps its ice (and its
+  backup, for a later Clear) but not its icicles, and the report warns about it. Load the cells a zone covers before
+  you apply it.
 - Every mesh the zone touches keeps an exact backup: vertex colours, mesh-paint cache, custom primitive data and the
   raw override-material array, including its length and null entries. Clear restores all of it. A backup is never
   thrown away when restoring fails.

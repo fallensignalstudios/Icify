@@ -192,7 +192,9 @@ namespace Icify
 			Frost = FMath::Max(Frost, Edge * Params.EdgeFrost * FMath::Lerp(0.7f, 1.f, Open));
 			if (Params.Rime > 0.f && Wind > 0.f)
 			{
-				Frost = FMath::Max(Frost, Params.Rime * Wind * FMath::Pow(Windward, 1.5f) * (0.45f + 0.55f * Edge));
+				// Rime builds on top of the frost already there, so it still shows on heavily frosted convex edges.
+				const float RimeCover = FMath::Clamp(Params.Rime * Wind * FMath::Pow(Windward, 1.5f) * (0.45f + 0.55f * Edge), 0.f, 1.f);
+				Frost = 1.f - (1.f - FMath::Clamp(Frost, 0.f, 1.f)) * (1.f - RimeCover);
 			}
 			if (Params.GroundFrost > 0.f)
 			{
@@ -666,12 +668,14 @@ namespace Icify
 
 		/**
 		 * Icicle candidates where meltwater collects and drips. Water runs downhill over the surface, so it gathers at sink
-		 * vertices: ones with no lower neighbour. A sink drips when water flows into it from above and the surface there has
-		 * turned under past the overhang angle (the bottom edge of a ledge, eave or sill, however it's bevelled or rounded,
-		 * and the lowest line of a pipe or rail), or when it's on an open border that water spills off (a single-sided roof
-		 * plane, the bottom of a sign). Icicles grow along edges joining two drip vertices, and from lone drip vertices
-		 * (the bottom of a dome, the low end of a tilted pipe). Whether water actually reaches them (snow above, a melt
-		 * source) and whether there's room below is decided by the zone, with traces, on the game thread.
+		 * vertices: ones with no clearly lower neighbour (anything within 2 degrees of level counts as level, so a slightly
+		 * tilted ledge still collects water along its edges). A sink drips when water flows into it from above and a face
+		 * around it has turned under past the overhang angle (the bottom edge of a ledge, beam, eave or sill, however it's
+		 * bevelled or rounded, and the lowest line of a pipe or rail), or when it's on an open border that water spills off (a
+		 * single-sided roof plane, the bottom of a sign). Icicles grow along edges joining two drip vertices, and from lone
+		 * drip vertices at true low points (the bottom of a dome, the low end of a tilted pipe). Whether water actually
+		 * reaches them (snow above, a melt source) and whether there's room below is decided by the zone, with traces, on the
+		 * game thread.
 		 */
 		void CollectDripPoints(const FTopology& Topo, const FStaticMeshVertexBuffer& Attributes, const FIcifyComponentContext& Context,
 			const FIcifyGenerationParams& Params, FIcifyComponentResult& Out)
@@ -680,13 +684,20 @@ namespace Icify
 			const int32 NumWelded = Topo.WeldFirst.Num();
 			const int32 NumTris = Topo.FaceN.Num();
 			const float Overhang = FMath::Sin(FMath::DegreesToRadians(FMath::Clamp(Params.DripOverhangDeg, 0.f, 80.f)));
+			const float LevelSlope = FMath::Tan(FMath::DegreesToRadians(2.f));
+			const float InflowSlope = FMath::Tan(FMath::DegreesToRadians(1.f));
 
-			// Neighbour heights, open-border membership and one triangle per welded vertex.
-			TArray<float> MinNeighbourZ;
-			TArray<float> MaxNeighbourZ;
-			MinNeighbourZ.Init(TNumericLimits<float>::Max(), NumWelded);
-			MaxNeighbourZ.Init(-TNumericLimits<float>::Max(), NumWelded);
+			// Per welded vertex: whether water runs on downhill from it, the steepest climb to a neighbour (water flowing in),
+			// whether every neighbour is higher (a true low point), the lowest-facing face around it and one of its triangles.
+			TArray<uint8> RunsOn;
+			TArray<uint8> LowPoint;
+			TArray<float> SteepestClimb;
+			TArray<float> LowestFaceZ;
 			TArray<int32> AnyTri;
+			RunsOn.Init(0, NumWelded);
+			LowPoint.Init(1, NumWelded);
+			SteepestClimb.Init(0.f, NumWelded);
+			LowestFaceZ.Init(1.f, NumWelded);
 			AnyTri.Init(INDEX_NONE, NumWelded);
 			for (int32 T = 0; T < NumTris; ++T)
 			{
@@ -697,18 +708,31 @@ namespace Icify
 				const int32 W[3] = { Topo.Weld[Topo.Indices[T * 3]], Topo.Weld[Topo.Indices[T * 3 + 1]], Topo.Weld[Topo.Indices[T * 3 + 2]] };
 				for (int32 K = 0; K < 3; ++K)
 				{
-					if (AnyTri[W[K]] == INDEX_NONE)
+					const int32 Wk = W[K];
+					if (AnyTri[Wk] == INDEX_NONE)
 					{
-						AnyTri[W[K]] = T;
+						AnyTri[Wk] = T;
 					}
+					LowestFaceZ[Wk] = FMath::Min(LowestFaceZ[Wk], float(Topo.FaceN[T].Z));
+					const FVector& Here = Topo.Pos[Topo.WeldFirst[Wk]];
 					for (int32 J = 0; J < 3; ++J)
 					{
-						if (W[J] != W[K])
+						if (W[J] == Wk)
 						{
-							const float Z = float(Topo.Pos[Topo.WeldFirst[W[J]]].Z);
-							MinNeighbourZ[W[K]] = FMath::Min(MinNeighbourZ[W[K]], Z);
-							MaxNeighbourZ[W[K]] = FMath::Max(MaxNeighbourZ[W[K]], Z);
+							continue;
 						}
+						const FVector& There = Topo.Pos[Topo.WeldFirst[W[J]]];
+						const float Climb = float(There.Z - Here.Z);
+						const float Span = float(FVector2D(There.X - Here.X, There.Y - Here.Y).Size());
+						if (Climb < -(0.05f + LevelSlope * Span))
+						{
+							RunsOn[Wk] = 1;
+						}
+						if (Climb <= 0.05f)
+						{
+							LowPoint[Wk] = 0;
+						}
+						SteepestClimb[Wk] = FMath::Max(SteepestClimb[Wk], Climb / FMath::Max(Span, 0.01f));
 					}
 				}
 			}
@@ -729,24 +753,19 @@ namespace Icify
 			Drip.Init(0.f, NumWelded);
 			for (int32 Wi = 0; Wi < NumWelded; ++Wi)
 			{
-				if (AnyTri[Wi] == INDEX_NONE)
+				if (AnyTri[Wi] == INDEX_NONE || RunsOn[Wi])
 				{
-					continue;
+					continue; // nothing here, or water runs on downhill
 				}
-				const float Z = float(Topo.Pos[Topo.WeldFirst[Wi]].Z);
-				if (MinNeighbourZ[Wi] < Z - 0.05f)
-				{
-					continue; // water runs on, downhill
-				}
-				const float NZ = float(Topo.WeldNrm[Wi].Z);
 				float Value = 0.f;
-				// Turned under: water flows in from above and hangs here.
-				if (MaxNeighbourZ[Wi] > Z + 0.2f)
+				// Turned under: water flows in from above and hangs here. The lowest-facing face decides, not the vertex normal,
+				// which the tall sides of a beam or sign would swamp at its bottom corners.
+				if (SteepestClimb[Wi] > InflowSlope)
 				{
-					Value = FMath::SmoothStep(Overhang, Overhang + 0.4f, -NZ);
+					Value = FMath::SmoothStep(Overhang, Overhang + 0.4f, -LowestFaceZ[Wi]);
 				}
 				// Spilling off an open border of a face that isn't an underside.
-				if (OnBorder[Wi] && NZ > -0.5f)
+				if (OnBorder[Wi] && Topo.WeldNrm[Wi].Z > -0.5)
 				{
 					Value = 1.f;
 				}
@@ -775,6 +794,19 @@ namespace Icify
 			{
 				V.Z = 0.0;
 				return V.SizeSquared() > 0.04 ? V.GetSafeNormal() : FVector::ZeroVector;
+			};
+			// The triangle's own vertex at a welded position, so gate UVs come from that triangle's UV island.
+			auto CornerOf = [&Topo](int32 Tri, int32 Welded)
+			{
+				for (int32 K = 0; K < 3; ++K)
+				{
+					const uint32 Vertex = Topo.Indices[Tri * 3 + K];
+					if (Topo.Weld[Vertex] == Welded)
+					{
+						return Vertex;
+					}
+				}
+				return uint32(Topo.WeldFirst[Welded]);
 			};
 
 			for (const TPair<uint64, FIntPoint>& Pair : EdgeFaces)
@@ -836,12 +868,12 @@ namespace Icify
 				Edge.Outward = Outward;
 				Edge.Strength = FMath::Min(Drip[WA], Drip[WB]) * Level(Dir);
 				Edge.Tri = Pair.Value.X;
-				Edge.VA = uint32(Topo.WeldFirst[WA]);
-				Edge.VB = uint32(Topo.WeldFirst[WB]);
+				Edge.VA = CornerOf(Pair.Value.X, WA);
+				Edge.VB = CornerOf(Pair.Value.X, WB);
 			}
 			for (int32 Wi = 0; Wi < NumWelded; ++Wi)
 			{
-				if (Drip[Wi] > 0.f && !Used[Wi])
+				if (Drip[Wi] > 0.f && !Used[Wi] && LowPoint[Wi])
 				{
 					FDripEdge& Edge = DripEdges.AddDefaulted_GetRef();
 					Edge.A = Edge.B = Topo.Pos[Topo.WeldFirst[Wi]];
@@ -849,7 +881,7 @@ namespace Icify
 					Edge.Outward = LevelUnit(Topo.WeldNrm[Wi]);
 					Edge.Strength = Drip[Wi];
 					Edge.Tri = AnyTri[Wi];
-					Edge.VA = Edge.VB = uint32(Topo.WeldFirst[Wi]);
+					Edge.VA = Edge.VB = CornerOf(AnyTri[Wi], Wi);
 				}
 			}
 
@@ -861,6 +893,39 @@ namespace Icify
 			}
 			const double Spacing = FMath::Max<double>(FMath::Max(Params.DripSpacing, 0.5f), TotalLength / MaxPoints);
 			Out.DripSpacingCm = float(Spacing);
+
+			// A candidate closer than half the spacing to an earlier one is skipped, so near-duplicate drip lines (the bottom
+			// of a finely tessellated pipe, doubled edges) don't multiply the icicles.
+			const double MinGap = Spacing * 0.5;
+			TMap<FIntVector, TArray<int32>> Taken;
+			auto GapCell = [MinGap](const FVector& P)
+			{
+				return FIntVector(FMath::FloorToInt(P.X / MinGap), FMath::FloorToInt(P.Y / MinGap), FMath::FloorToInt(P.Z / MinGap));
+			};
+			auto IsTaken = [&Taken, &GapCell, &Out, MinGap](const FVector& P)
+			{
+				const FIntVector Center = GapCell(P);
+				for (int32 Z = -1; Z <= 1; ++Z)
+				{
+					for (int32 Y = -1; Y <= 1; ++Y)
+					{
+						for (int32 X = -1; X <= 1; ++X)
+						{
+							if (const TArray<int32>* Indices = Taken.Find(Center + FIntVector(X, Y, Z)))
+							{
+								for (const int32 Index : *Indices)
+								{
+									if (FVector::DistSquared(Out.DripPoints[Index].P, P) < MinGap * MinGap)
+									{
+										return true;
+									}
+								}
+							}
+						}
+					}
+				}
+				return false;
+			};
 
 			for (const FDripEdge& Edge : DripEdges)
 			{
@@ -876,14 +941,21 @@ namespace Icify
 				const double Length = FVector::Dist(Edge.A, Edge.B);
 				const bool bPoint = Length < 0.5;
 				const FVector Dir = bPoint ? FVector::ZeroVector : (Edge.B - Edge.A) / Length;
-				const int32 Count = bPoint ? 1 : FMath::Max(1, FMath::FloorToInt(Length / Spacing));
+				// One candidate per spacing on average, however finely the edge is cut up: a fixed phase per edge rounds its
+				// count up or down, so short edges sometimes get none. The phase ignores the seed, so reseeding keeps the points.
+				int32 Count = 1;
+				if (!bPoint)
+				{
+					const float Phase = float(PointHash((Edge.A + Edge.B) * 0.5, 0x5bd1e995u) & 0x00FFFFFFu) / 16777216.f;
+					Count = FMath::Max(0, FMath::FloorToInt(float(Length / Spacing) + Phase));
+				}
 				for (int32 K = 0; K < Count && Out.DripPoints.Num() < MaxPoints; ++K)
 				{
 					// Centred samples, so two edges meeting at a corner don't both put a candidate on it.
 					const float T = bPoint ? 0.f : (float(K) + 0.5f) / float(Count);
 					const FVector P = FMath::Lerp(Edge.A, Edge.B, double(T));
 					const float ZoneW = ZoneWeight(Params, P);
-					if (ZoneW <= 0.f)
+					if (ZoneW <= 0.f || IsTaken(P))
 					{
 						continue;
 					}
@@ -903,6 +975,7 @@ namespace Icify
 						continue;
 					}
 
+					Taken.FindOrAdd(GapCell(P)).Add(Out.DripPoints.Num());
 					FIcifyDripPoint& Point = Out.DripPoints.AddDefaulted_GetRef();
 					Point.P = P;
 					Point.Tangent = Dir;
@@ -1647,6 +1720,12 @@ namespace Icify
 			}
 		}
 		OutResult.DominantSurface = EIcifySurfaceType(Best + 1);
+		// Coverage and drip collection don't poll, so a cancel during them is caught here.
+		if (Params.CancelRequested())
+		{
+			OutResult.bCancelled = true;
+			return false;
+		}
 		return true;
 	}
 

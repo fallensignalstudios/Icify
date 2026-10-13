@@ -612,7 +612,7 @@ namespace
 		return Material ? Material->GetMaterial() : nullptr;
 	}
 
-	void Notify(const FText& Message, bool bError)
+	void NotifyHookup(const FText& Message, bool bError)
 	{
 		FNotificationInfo Info(Message);
 		Info.ExpireDuration = bError ? 8.f : 5.f;
@@ -624,7 +624,7 @@ namespace
 	{
 		if (Materials.Num() == 0)
 		{
-			Notify(LOCTEXT("NothingSelected", "Icify: no materials to change. Select materials or material instances in the Content Browser."), false);
+			NotifyHookup(LOCTEXT("NothingSelected", "Icify: no materials to change. Select materials or material instances in the Content Browser."), false);
 			return;
 		}
 
@@ -659,7 +659,7 @@ namespace
 				Counts.FindRef(TEXT("added")), Counts.FindRef(TEXT("already")), Counts.FindRef(TEXT("skipped")), Failed)
 			: FString::Printf(TEXT("Icify: removed from %d material(s), %d skipped, %d failed. Save them to keep the change. Details: Saved/Icify/MaterialHookup.txt"),
 				Counts.FindRef(TEXT("removed")), Counts.FindRef(TEXT("skipped")), Failed);
-		Notify(FText::FromString(Summary), Failed > 0);
+		NotifyHookup(FText::FromString(Summary), Failed > 0);
 	}
 
 	TArray<UMaterial*> SelectedBaseMaterials()
@@ -684,12 +684,30 @@ bool UIcifyMaterialHookup::UsesIcify(const UMaterialInterface* Material)
 	return Material && Material->GetScalarParameterDefaultValue(FHashedMaterialParameterInfo(Icify::ActiveParameterName()), Value);
 }
 
+namespace
+{
+	/** A lit surface material wired the way the hookup knows (not Substrate, not landscape). */
+	bool IsHookableSurface(const UMaterial* Material, const UMaterialEditorOnlyData* Data)
+	{
+		return Material->MaterialDomain == MD_Surface && !Material->GetShadingModels().IsUnlit() && !Data->FrontMaterial.IsConnected()
+			&& !IsLandscapeMaterial(Material);
+	}
+}
+
 bool UIcifyMaterialHookup::CanHookUp(const UMaterial* Material)
 {
 	FString Why;
 	const UMaterialEditorOnlyData* Data = Material ? Material->GetEditorOnlyData() : nullptr;
-	return Data && IsWritable(Material, Why) && Material->MaterialDomain == MD_Surface && !Material->GetShadingModels().IsUnlit()
-		&& !Data->FrontMaterial.IsConnected() && !IsLandscapeMaterial(Material);
+	return Data && IsWritable(Material, Why) && IsHookableSurface(Material, Data);
+}
+
+bool UIcifyMaterialHookup::NeedsPrivateCopy(const UMaterial* Material)
+{
+	FString Why;
+	const UMaterialEditorOnlyData* Data = Material ? Material->GetEditorOnlyData() : nullptr;
+	const UPackage* Package = Material ? Material->GetPackage() : nullptr;
+	return Data && Package && !IsWritable(Material, Why) && Package->GetName().StartsWith(TEXT("/Engine/"))
+		&& !Package->HasAnyPackageFlags(PKG_Cooked) && IsHookableSurface(Material, Data);
 }
 
 FIcifyHookupResult UIcifyMaterialHookup::AddIcifyToMaterial(UMaterialInterface* MaterialInterface, bool bBackup)
@@ -904,8 +922,11 @@ FIcifyHookupResult UIcifyMaterialHookup::RemoveIcifyFromMaterial(UMaterialInterf
 
 namespace
 {
-	/** Static mesh materials on Actor (inside one of Zones, when there are any) that could take Icify. */
-	void AddUnhookedMeshMaterials(const AActor* Actor, const TArray<FBox>& Zones, TArray<UMaterial*>& Materials)
+	/**
+	 * Static mesh materials on Actor (inside one of Zones, when there are any) that don't use Icify yet and could take it:
+	 * in place, or (bCopyOnly) only through a private copy.
+	 */
+	void AddUnhookedMeshMaterials(const AActor* Actor, const TArray<FBox>& Zones, bool bCopyOnly, TArray<UMaterial*>& Materials)
 	{
 		TInlineComponentArray<UStaticMeshComponent*> Components(Actor);
 		for (const UStaticMeshComponent* Component : Components)
@@ -922,7 +943,8 @@ namespace
 			for (int32 Slot = 0; Slot < Component->GetNumMaterials(); ++Slot)
 			{
 				UMaterial* Base = ResolveBase(Component->GetMaterial(Slot));
-				if (Base && !UIcifyMaterialHookup::UsesIcify(Base) && UIcifyMaterialHookup::CanHookUp(Base))
+				if (Base && !UIcifyMaterialHookup::UsesIcify(Base)
+					&& (bCopyOnly ? UIcifyMaterialHookup::NeedsPrivateCopy(Base) : UIcifyMaterialHookup::CanHookUp(Base)))
 				{
 					Materials.AddUnique(Base);
 				}
@@ -931,44 +953,74 @@ namespace
 	}
 }
 
-TArray<UMaterial*> UIcifyMaterialHookup::FindUnhookedMaterialsInLevel()
+namespace
 {
-	TArray<UMaterial*> Materials;
-	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
-	if (!World)
+	/** The level's unhooked materials (inside zones, if there are any). */
+	TArray<UMaterial*> LevelMaterials(bool bCopyOnly)
 	{
+		TArray<UMaterial*> Materials;
+		UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+		if (!World)
+		{
+			return Materials;
+		}
+
+		TArray<FBox> Zones;
+		for (TActorIterator<AIcifyFreezeZone> It(World); It; ++It)
+		{
+			if (const UIcifyZoneComponent* Zone = It->GetZoneComponent())
+			{
+				Zones.Add(Zone->Bounds.GetBox());
+			}
+		}
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			if (!It->IsA<AIcifyFreezeZone>())
+			{
+				AddUnhookedMeshMaterials(*It, Zones, bCopyOnly, Materials);
+			}
+		}
 		return Materials;
 	}
 
-	TArray<FBox> Zones;
-	for (TActorIterator<AIcifyFreezeZone> It(World); It; ++It)
+	TArray<UMaterial*> ActorMaterials(const TArray<AActor*>& Actors, bool bCopyOnly)
 	{
-		if (const UIcifyZoneComponent* Zone = It->GetZoneComponent())
+		TArray<UMaterial*> Materials;
+		for (const AActor* Actor : Actors)
 		{
-			Zones.Add(Zone->Bounds.GetBox());
+			if (Actor && !Actor->IsA<AIcifyFreezeZone>())
+			{
+				AddUnhookedMeshMaterials(Actor, {}, bCopyOnly, Materials);
+			}
 		}
+		return Materials;
 	}
-	for (TActorIterator<AActor> It(World); It; ++It)
+
+	/** Engine materials can't take Icify in place; says what to do about them instead. Empty when there are none. */
+	FString CopyOnlyAdvice(const TArray<UMaterial*>& CopyOnly)
 	{
-		if (!It->IsA<AIcifyFreezeZone>())
+		if (CopyOnly.Num() == 0)
 		{
-			AddUnhookedMeshMaterials(*It, Zones, Materials);
+			return FString();
 		}
+		return FString::Printf(TEXT("%d engine material(s), such as %s, can't be hooked up in place, so meshes using them show no ice. ")
+			TEXT("Select those actors and run Freeze Selected Actors: it makes private copies that can."), CopyOnly.Num(), *CopyOnly[0]->GetName());
 	}
-	return Materials;
+}
+
+TArray<UMaterial*> UIcifyMaterialHookup::FindUnhookedMaterialsInLevel()
+{
+	return LevelMaterials(/*bCopyOnly*/ false);
 }
 
 TArray<UMaterial*> UIcifyMaterialHookup::FindUnhookedMaterialsOn(const TArray<AActor*>& Actors)
 {
-	TArray<UMaterial*> Materials;
-	for (const AActor* Actor : Actors)
-	{
-		if (Actor && !Actor->IsA<AIcifyFreezeZone>())
-		{
-			AddUnhookedMeshMaterials(Actor, {}, Materials);
-		}
-	}
-	return Materials;
+	return ActorMaterials(Actors, /*bCopyOnly*/ false);
+}
+
+TArray<UMaterial*> UIcifyMaterialHookup::FindCopyOnlyMaterialsOn(const TArray<AActor*>& Actors)
+{
+	return ActorMaterials(Actors, /*bCopyOnly*/ true);
 }
 
 void UIcifyMaterialHookup::HookUpMaterials(const TArray<UMaterial*>& Materials)
@@ -989,9 +1041,11 @@ void UIcifyMaterialHookup::RemoveFromSelectedAssets()
 void UIcifyMaterialHookup::HookUpLevel()
 {
 	const TArray<UMaterial*> Materials = FindUnhookedMaterialsInLevel();
+	const FString Advice = CopyOnlyAdvice(LevelMaterials(/*bCopyOnly*/ true));
 	if (Materials.Num() == 0)
 	{
-		Notify(LOCTEXT("LevelHooked", "Icify: every editable material in the level (inside freeze zones, if any) already uses Icify."), false);
+		NotifyHookup(FText::Format(LOCTEXT("LevelHooked", "Icify: every editable material in the level (inside freeze zones, if any) already uses Icify. {0}"),
+			FText::FromString(Advice)), false);
 		return;
 	}
 
@@ -1006,8 +1060,9 @@ void UIcifyMaterialHookup::HookUpLevel()
 	}
 	const FText Question = FText::Format(LOCTEXT("ConfirmLevel",
 		"Hook up {0} master material(s) so they show Icify ice?\n\n{1}\n\nEach is backed up to {2} first, and every instance of it is affected. "
-		"Remove Icify (right-click the material) puts the original wiring back."),
-		Materials.Num(), FText::FromString(FString::Join(Names, TEXT("\n"))), FText::FromString(BackupRoot));
+		"Remove Icify (right-click the material) puts the original wiring back.{3}"),
+		Materials.Num(), FText::FromString(FString::Join(Names, TEXT("\n"))), FText::FromString(BackupRoot),
+		FText::FromString(Advice.IsEmpty() ? FString() : TEXT("\n\n") + Advice));
 	if (FMessageDialog::Open(EAppMsgType::OkCancel, Question) == EAppReturnType::Ok)
 	{
 		RunBatch(Materials, /*bAdd*/ true);

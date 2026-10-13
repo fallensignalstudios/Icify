@@ -26,7 +26,7 @@
 
 namespace
 {
-	const TCHAR* ZoneBlueprintPath = TEXT("/Icify/BP_FreezeZone.BP_FreezeZone");
+	const TCHAR* ZoneBlueprintObjectPath = TEXT("/Icify/BP_FreezeZone.BP_FreezeZone");
 	/** Past the zone's default 50 cm falloff, so the selection itself is fully frozen. */
 	constexpr double MinPaddingCm = 60.;
 	constexpr double PaddingFraction = 0.1;
@@ -47,7 +47,7 @@ namespace
 	UClass* ZoneClass()
 	{
 		// The plugin's Blueprint when it exists (it is what users place by hand), the native class otherwise.
-		if (const UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, ZoneBlueprintPath, nullptr, LOAD_NoWarn | LOAD_Quiet))
+		if (const UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, ZoneBlueprintObjectPath, nullptr, LOAD_NoWarn | LOAD_Quiet))
 		{
 			if (Blueprint->GeneratedClass && Blueprint->GeneratedClass->IsChildOf(AIcifyFreezeZone::StaticClass()))
 			{
@@ -57,7 +57,7 @@ namespace
 		return AIcifyFreezeZone::StaticClass();
 	}
 
-	void Notify(const FText& Message, bool bError)
+	void NotifyQuickStart(const FText& Message, bool bError)
 	{
 		FNotificationInfo Info(Message);
 		Info.ExpireDuration = bError ? 8.f : 5.f;
@@ -262,33 +262,74 @@ void FIcifyQuickStart::FreezeSelected()
 	// One undo step for everything below that touches the level (private slot assignments, zone, masks, icicles).
 	const FScopedTransaction Transaction(LOCTEXT("FreezeSelectedAll", "Icify: Freeze Selected Actors"));
 
-	// Masks only show through materials that call Icify, so offer to hook up what the selection uses.
+	// Masks only show through materials that call Icify, so offer to hook up what the selection uses. Engine materials (the
+	// basic shapes' material, for one) can't be changed in place, so they always get private copies.
 	TArray<FString> Created;
 	TArray<FString> Notes;
 	const TArray<UMaterial*> Unhooked = UIcifyMaterialHookup::FindUnhookedMaterialsOn(Actors);
-	if (Unhooked.Num() > 0)
+	const TArray<UMaterial*> CopyOnly = UIcifyMaterialHookup::FindCopyOnlyMaterialsOn(Actors);
+	if (Unhooked.Num() > 0 || CopyOnly.Num() > 0)
 	{
+		const int32 Total = Unhooked.Num() + CopyOnly.Num();
 		TArray<FString> Names;
-		for (int32 Index = 0; Index < Unhooked.Num() && Index < 10; ++Index)
+		for (const UMaterial* Material : Unhooked)
 		{
-			Names.Add(TEXT("  ") + Unhooked[Index]->GetPathName());
+			if (Names.Num() < 10)
+			{
+				Names.Add(TEXT("  ") + Material->GetPathName());
+			}
 		}
-		if (Unhooked.Num() > 10)
+		for (const UMaterial* Material : CopyOnly)
 		{
-			Names.Add(FString::Printf(TEXT("  ...and %d more"), Unhooked.Num() - 10));
+			if (Names.Num() < 10)
+			{
+				Names.Add(TEXT("  ") + Material->GetPathName() + TEXT("  (engine content: private copy only)"));
+			}
 		}
-		const EAppReturnType::Type Answer = FMessageDialog::Open(EAppMsgType::YesNoCancel, FText::Format(LOCTEXT("ConfirmHookupPrivate",
-			"The selection uses {0} master material(s) that don't show Icify ice yet:\n\n{1}\n\n"
-			"Yes (recommended): make private copies for the selected actors only, in {2}. Shared masters and every other "
-			"actor are left unchanged; Undo puts the selection's original materials back (the copies stay on disk to delete or keep).\n\n"
-			"No: hook up the shared masters themselves. Each is backed up first, but every instance of them in the project is affected.\n\n"
+		if (Total > 10)
+		{
+			Names.Add(FString::Printf(TEXT("  ...and %d more"), Total - 10));
+		}
+		const FText List = FText::FromString(FString::Join(Names, TEXT("\n")));
+
+		bool bPrivate = true;
+		if (Unhooked.Num() > 0)
+		{
+			const EAppReturnType::Type Answer = FMessageDialog::Open(EAppMsgType::YesNoCancel, FText::Format(LOCTEXT("ConfirmHookupPrivate",
+				"The selection uses {0} master material(s) that don't show Icify ice yet:\n\n{1}\n\n"
+				"Yes (recommended): make private copies for the selected actors only, in {2}. Shared masters and every other "
+				"actor are left unchanged; Undo puts the selection's original materials back (the copies stay on disk to delete or keep).\n\n"
+				"No: hook up the shared masters themselves. Each is backed up first, but every instance of them in the project is affected. "
+				"Engine materials can't be changed, so they get private copies either way.\n\n"
+				"Cancel: do nothing.\n\nIcicles grow either way: they have their own material."),
+				Total, List, FText::FromString(PrivateFolder)));
+			if (Answer == EAppReturnType::Cancel)
+			{
+				return;
+			}
+			bPrivate = Answer == EAppReturnType::Yes;
+		}
+		else if (FMessageDialog::Open(EAppMsgType::OkCancel, FText::Format(LOCTEXT("ConfirmPrivateCopies",
+			"The selection uses {0} engine material(s) that can't show Icify ice:\n\n{1}\n\n"
+			"OK: make private copies for the selected actors only, in {2}. The engine materials and every other actor are left "
+			"unchanged; Undo puts the selection's original materials back (the copies stay on disk to delete or keep).\n\n"
 			"Cancel: do nothing.\n\nIcicles grow either way: they have their own material."),
-			Unhooked.Num(), FText::FromString(FString::Join(Names, TEXT("\n"))), FText::FromString(PrivateFolder)));
-		if (Answer == EAppReturnType::Cancel)
+			Total, List, FText::FromString(PrivateFolder))) == EAppReturnType::Cancel)
 		{
 			return;
 		}
-		if (Answer == EAppReturnType::Yes)
+
+		if (!bPrivate)
+		{
+			UIcifyMaterialHookup::HookUpMaterials(Unhooked);
+		}
+		// Private copies of everything (Yes), or only of the engine materials (No).
+		TArray<UMaterial*> ToCopy = CopyOnly;
+		if (bPrivate)
+		{
+			ToCopy.Append(Unhooked);
+		}
+		if (ToCopy.Num() > 0)
 		{
 			TMap<UMaterialInterface*, UMaterialInterface*> CloneOf;
 			for (AActor* Actor : Actors)
@@ -304,7 +345,7 @@ void FIcifyQuickStart::FreezeSelected()
 					for (int32 Slot = 0; Slot < Component->GetNumMaterials(); ++Slot)
 					{
 						const UMaterialInterface* Material = Component->GetMaterial(Slot);
-						if (Material && Unhooked.Contains(Material->GetMaterial()))
+						if (Material && ToCopy.Contains(Material->GetMaterial()))
 						{
 							Slots.Add(Slot);
 						}
@@ -312,10 +353,6 @@ void FIcifyQuickStart::FreezeSelected()
 					ClonePrivateMaterials(Component, Slots, PrivateFolder, CloneOf, Created, Notes);
 				}
 			}
-		}
-		else
-		{
-			UIcifyMaterialHookup::HookUpMaterials(Unhooked);
 		}
 	}
 
@@ -334,7 +371,7 @@ void FIcifyQuickStart::FreezeSelected()
 	{
 		Message += FString::Printf(TEXT(" Created %d private material asset(s) in %s; save or delete them."), Created.Num(), PrivateFolder);
 	}
-	Notify(FText::FromString(TEXT("Icify: ") + Message), Zone == nullptr);
+	NotifyQuickStart(FText::FromString(TEXT("Icify: ") + Message), Zone == nullptr);
 }
 
 #undef LOCTEXT_NAMESPACE

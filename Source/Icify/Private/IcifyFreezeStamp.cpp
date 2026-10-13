@@ -35,8 +35,9 @@ void AIcifyFreezeStamp::SyncShape()
 
 FBox AIcifyFreezeStamp::GetStampBounds() const
 {
-	const FVector Extent = GetActorScale3D().GetAbs() * RadiusCm;
-	return FBox(GetActorLocation() - Extent, GetActorLocation() + Extent);
+	// Everything the stamp can touch: its scaled, rotated sphere, grown by the furthest its noisy edge reaches.
+	const double Reach = double(RadiusCm) * (1.0 + 0.5 * double(FMath::Max(EdgeNoise, 0.f)));
+	return FBox(FVector(-Reach), FVector(Reach)).TransformBy(GetActorTransform());
 }
 
 float AIcifyFreezeStamp::WeightAt(const FVector& WorldPoint, float FeatureScaleCm) const

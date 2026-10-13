@@ -186,9 +186,15 @@ namespace Icify
 		return EIcifySurfaceType::Auto;
 	}
 
-	static EIcifySurfaceType SurfaceFromName(const FString& Name, const UIcifySettings* Settings, FString* OutKeyword = nullptr)
+	/** bAllowGlass turns off for good once a name says it's a window's frame or sill, so the mesh name ("SM_Window")
+	 * can't make that slot glass later on. */
+	static EIcifySurfaceType SurfaceFromName(const FString& Name, const UIcifySettings* Settings, bool& bAllowGlass, FString* OutKeyword = nullptr)
 	{
-		if (NameMatches(Name, Settings->GlassKeywords, OutKeyword))
+		if (bAllowGlass && NameMatches(Name, Settings->NotGlassKeywords, nullptr))
+		{
+			bAllowGlass = false;
+		}
+		if (bAllowGlass && NameMatches(Name, Settings->GlassKeywords, OutKeyword))
 		{
 			return EIcifySurfaceType::Glass;
 		}
@@ -279,6 +285,7 @@ namespace Icify
 		}
 
 		// 2. Physical material, then material names up the instance chain.
+		bool bAllowGlass = true;
 		if (UMaterialInterface* Material = Component->GetMaterial(MaterialIndex))
 		{
 			if (const UPhysicalMaterial* PhysMat = Material->GetPhysicalMaterial())
@@ -295,7 +302,7 @@ namespace Icify
 
 			for (const UMaterialInterface* It = Material; It; )
 			{
-				Result = SurfaceFromName(It->GetName(), Settings, &Keyword);
+				Result = SurfaceFromName(It->GetName(), Settings, bAllowGlass, &Keyword);
 				if (Result != EIcifySurfaceType::Auto)
 				{
 					Explain(FString::Printf(TEXT("keyword '%s' in material %s%s"), *Keyword, *It->GetName(), It == Material ? TEXT("") : TEXT(" (parent)")));
@@ -312,7 +319,7 @@ namespace Icify
 			const FString SlotName = SlotNameOf(Component, MaterialIndex);
 			if (!SlotName.IsEmpty())
 			{
-				Result = SurfaceFromName(SlotName, Settings, &Keyword);
+				Result = SurfaceFromName(SlotName, Settings, bAllowGlass, &Keyword);
 				if (Result != EIcifySurfaceType::Auto)
 				{
 					Explain(FString::Printf(TEXT("keyword '%s' in slot name %s"), *Keyword, *SlotName));
@@ -320,7 +327,7 @@ namespace Icify
 				}
 			}
 
-			Result = SurfaceFromName(Mesh->GetName(), Settings, &Keyword);
+			Result = SurfaceFromName(Mesh->GetName(), Settings, bAllowGlass, &Keyword);
 			if (Result != EIcifySurfaceType::Auto)
 			{
 				Explain(FString::Printf(TEXT("keyword '%s' in mesh %s"), *Keyword, *Mesh->GetName()));
@@ -330,7 +337,7 @@ namespace Icify
 
 		if (Owner)
 		{
-			Result = SurfaceFromName(Owner->GetActorLabel(), Settings, &Keyword);
+			Result = SurfaceFromName(Owner->GetActorLabel(), Settings, bAllowGlass, &Keyword);
 			if (Result != EIcifySurfaceType::Auto)
 			{
 				Explain(FString::Printf(TEXT("keyword '%s' in actor label %s"), *Keyword, *Owner->GetActorLabel()));

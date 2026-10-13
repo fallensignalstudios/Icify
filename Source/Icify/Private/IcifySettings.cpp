@@ -17,12 +17,17 @@ UIcifySettings::UIcifySettings()
 	GlassKeywords = { TEXT("glass"), TEXT("window"), TEXT("windshield"), TEXT("windscreen"), TEXT("glazing"), TEXT("mirror"),
 		TEXT("skylight") };
 
+	NotGlassKeywords = { TEXT("frame"), TEXT("sill"), TEXT("ledge"), TEXT("lintel"), TEXT("shutter"), TEXT("sash"), TEXT("mullion"),
+		TEXT("trim"), TEXT("casing"), TEXT("surround"), TEXT("grille") };
+
 	DripKeywords = { TEXT("gutter"), TEXT("downpipe"), TEXT("downspout"), TEXT("drainpipe"), TEXT("spout"), TEXT("drain"),
 		TEXT("overflow"), TEXT("scupper"), TEXT("vent"), TEXT("faucet") };
 
-	// Lanterns and candles are left out on purpose: winter scenes are full of them, and they barely melt anything.
-	HeatKeywords = { TEXT("fire"), TEXT("bonfire"), TEXT("campfire"), TEXT("torch"), TEXT("brazier"), TEXT("furnace"), TEXT("forge"),
-		TEXT("hearth"), TEXT("fireplace"), TEXT("stove"), TEXT("heater"), TEXT("radiator"), TEXT("boiler"), TEXT("chimney"), TEXT("exhaust") };
+	// Lanterns and candles are left out on purpose: winter scenes are full of them, and they barely melt anything. So is a
+	// bare "fire", which would also catch FireHydrant, FireEscape and Firewood; tag other fires with Icify.Heat.
+	HeatKeywords = { TEXT("bonfire"), TEXT("campfire"), TEXT("fireplace"), TEXT("firepit"), TEXT("torch"), TEXT("brazier"),
+		TEXT("furnace"), TEXT("forge"), TEXT("hearth"), TEXT("stove"), TEXT("heater"), TEXT("radiator"), TEXT("boiler"), TEXT("chimney"),
+		TEXT("exhaust") };
 
 	MaskDebugMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Icify/Materials/M_IcifyMaskDebug.M_IcifyMaskDebug")));
 	IcicleMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Icify/Materials/M_IcifyIcicle.M_IcifyIcicle")));

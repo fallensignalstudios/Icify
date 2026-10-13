@@ -504,7 +504,8 @@ public:
 	virtual void PostEditMove(bool bFinished) override;
 	virtual void PostEditImport() override;
 	virtual void PostDuplicate(EDuplicateMode::Type DuplicateMode) override;
-	/** Last line of defence: preview icicles are never saved, and applied icicles are never saved hidden. */
+	/** Last line of defence: a level save never keeps preview icicles or hidden applied ones (autosaves, procedural saves
+	 * and cooks keep the whole preview, as the editor module does). */
 	virtual void PreSave(FObjectPreSaveContext SaveContext) override;
 	/** Undo/redo restores the icicle sections; make sure both components redraw from them. */
 	virtual void PostEditUndo() override;
@@ -533,7 +534,7 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Icify")
 	TObjectPtr<UProceduralMeshComponent> IcicleMesh;
 
-	/** Preview icicles: never saved (emptied before every save). */
+	/** Preview icicles: emptied before every level save (autosaves keep the whole preview). */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Icify")
 	TObjectPtr<UProceduralMeshComponent> PreviewIcicleMesh;
 
@@ -559,6 +560,8 @@ private:
 
 	void UpdateWindArrow();
 	void ConfigureIcicleComponent(UProceduralMeshComponent* Mesh) const;
+	/** Moves empty icicle components to the zone, so their point bounds don't stretch the zone's out to the world origin. */
+	void ParkEmptyIcicleComponents();
 
 #if WITH_EDITOR
 	/** Per-component results keyed by component path (editor only, never saved). */
@@ -592,7 +595,7 @@ private:
 	void BuildIcicles(const FIcifyGenerationJob& Job, const TSet<int32>& FrozenReports, FIcifyIcicleBuild& OutBuild);
 	/** Replaces Target's sections with the built icicles. */
 	void WriteIcicles(UProceduralMeshComponent* Target, const FIcifyIcicleBuild& Build, bool bTransactional);
-	UMaterialInterface* ResolveIcicleMaterial(UProceduralMeshComponent* Owner);
+	UMaterialInterface* ResolveIcicleMaterial(UProceduralMeshComponent* IcicleComponent);
 	/** Empties the preview icicles and shows the applied ones again. */
 	void ClearPreviewIcicles(bool bTransactional);
 	/** Previewed meshes, preview icicles, or applied icicles hidden behind a preview. */

@@ -14,7 +14,7 @@
 namespace
 {
 	const TCHAR* LibraryFolder = TEXT("/Game/Icify/Library");
-	const TCHAR* ExampleMaterialPath = TEXT("/Icify/Materials/M_IcifyExample.M_IcifyExample");
+	const TCHAR* ExampleMaterialObjectPath = TEXT("/Icify/Materials/M_IcifyExample.M_IcifyExample");
 
 	/** One tuned look: notes and the settings that differ from the zone defaults. */
 	struct FLook
@@ -220,7 +220,7 @@ bool FIcifyLibraryBuilder::ConfigureLook(const FString& LookName, UIcifyPreset& 
 
 bool FIcifyLibraryBuilder::Build(bool bOverwrite, FString& OutMessage)
 {
-	UMaterialInterface* Example = LoadObject<UMaterialInterface>(nullptr, ExampleMaterialPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
+	UMaterialInterface* Example = LoadObject<UMaterialInterface>(nullptr, ExampleMaterialObjectPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
 	if (!Example)
 	{
 		OutMessage = TEXT("M_IcifyExample is missing; run Tools > Icify > Update Plugin Content first.");

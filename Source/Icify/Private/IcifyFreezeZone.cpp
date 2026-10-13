@@ -128,6 +128,20 @@ void AIcifyFreezeZone::OnConstruction(const FTransform& Transform)
 {
 	Super::OnConstruction(Transform);
 	UpdateWindArrow();
+	ParkEmptyIcicleComponents();
+}
+
+void AIcifyFreezeZone::ParkEmptyIcicleComponents()
+{
+	// The icicle components keep absolute transforms, and an empty one still reports a point bound at its location. Every
+	// path that empties one inside a transaction has already called Modify on it, so undo puts it back with its sections.
+	for (UProceduralMeshComponent* Mesh : { IcicleMesh.Get(), PreviewIcicleMesh.Get() })
+	{
+		if (Mesh && Mesh->GetNumSections() == 0 && !Mesh->GetComponentLocation().Equals(GetActorLocation()))
+		{
+			Mesh->SetWorldLocationAndRotation(GetActorLocation(), FQuat::Identity);
+		}
+	}
 }
 
 void AIcifyFreezeZone::UpdateWindArrow()
@@ -367,6 +381,21 @@ void AIcifyFreezeZone::Apply()
 		AppliedIcicleCount = Build.Stats.Icicles;
 		IciclePhase.Items = Build.Stats.Icicles;
 	}
+	// Meshes that keep an older record (not loaded, or not restorable) keep their ice but not their icicles.
+	int32 NumWithoutIcicles = 0;
+	for (const FIcifyComponentRecord& Record : AppliedRecords)
+	{
+		const UMeshComponent* Component = Record.Component.Get();
+		const bool bFrozenNow = Component && Results.ContainsByPredicate([Component, &Frozen](const FIcifyComponentResult& Result)
+		{
+			return Result.Component == Component && Frozen.Contains(Result.ReportIndex);
+		});
+		NumWithoutIcicles += bFrozenNow ? 0 : 1;
+	}
+	if (NumWithoutIcicles > 0)
+	{
+		LastReport.Warnings.Add(FString::Printf(TEXT("%d mesh(es) frozen earlier weren't frozen in this run (not loaded, or their backup was retained). They keep their ice but have no icicles until they're loaded and the zone is applied again."), NumWithoutIcicles));
+	}
 	for (const FString& Zone : TakenFrom)
 	{
 		LastReport.Warnings.Add(FString::Printf(TEXT("Took over meshes from %s. Its own icicles on them stay until that zone is applied again or cleared."), *Zone));
@@ -411,6 +440,7 @@ void AIcifyFreezeZone::Clear()
 		IcicleMesh->EmptyOverrideMaterials();
 	}
 	AppliedIcicleCount = 0;
+	ParkEmptyIcicleComponents();
 
 	Status = AppliedRecords.Num() > 0
 		? FString::Printf(TEXT("Cleared %d mesh(es) and %d icicle(s). %d backups retained (unloaded or restoration failed); see Output Log."), NumCleared, NumIcicles, AppliedRecords.Num())
@@ -677,8 +707,10 @@ void AIcifyFreezeZone::PostDuplicate(EDuplicateMode::Type DuplicateMode)
 void AIcifyFreezeZone::PreSave(FObjectPreSaveContext SaveContext)
 {
 	Super::PreSave(SaveContext);
-	// The editor module discards previews before a level is saved; this only catches saves that bypass it.
-	if (!IsTemplate() && !SaveContext.IsCooking())
+	// The editor module discards previews before a level is saved; this only catches saves that bypass it. Autosaves and
+	// procedural saves keep the whole preview, as the module does, so a recovery copy never holds half of one.
+	const bool bKeepsPreview = SaveContext.IsCooking() || SaveContext.IsProceduralSave() || (SaveContext.GetSaveFlags() & SAVE_FromAutosave) != 0;
+	if (!IsTemplate() && !bKeepsPreview)
 	{
 		ClearPreviewIcicles(/*bTransactional*/ false);
 	}
@@ -689,10 +721,27 @@ void AIcifyFreezeZone::PostEditUndo()
 	Super::PostEditUndo();
 	for (UProceduralMeshComponent* Mesh : { IcicleMesh.Get(), PreviewIcicleMesh.Get() })
 	{
-		if (Mesh)
+		if (!Mesh)
 		{
-			Mesh->MarkRenderStateDirty();
+			continue;
 		}
+		// Undo restores the sections but not the collision cooked from them. Clearing an emptied component drops stale
+		// collision; setting one section again recooks it for all of them and refreshes the bounds.
+		if (Mesh->GetNumSections() == 0)
+		{
+			Mesh->ClearAllMeshSections();
+		}
+		for (int32 Index = 0; Index < Mesh->GetNumSections(); ++Index)
+		{
+			const FProcMeshSection* Section = Mesh->GetProcMeshSection(Index);
+			if (Section && Section->bEnableCollision)
+			{
+				const FProcMeshSection Copy = *Section;
+				Mesh->SetProcMeshSection(Index, Copy);
+				break;
+			}
+		}
+		Mesh->MarkRenderStateDirty();
 	}
 }
 
@@ -711,6 +760,7 @@ void AIcifyFreezeZone::ForgetRecords()
 			Mesh->SetVisibility(true);
 		}
 	}
+	ParkEmptyIcicleComponents();
 	bPreviewActive = false;
 	Status.Reset();
 }
@@ -859,6 +909,7 @@ void AIcifyFreezeZone::ClearPreviewIcicles(bool bTransactional)
 		}
 		IcicleMesh->SetVisibility(true);
 	}
+	ParkEmptyIcicleComponents();
 }
 
 bool AIcifyFreezeZone::RestorePreview()
@@ -1112,16 +1163,16 @@ void AIcifyFreezeZone::BuildParams(FIcifyGenerationParams& P) const
 void AIcifyFreezeZone::BuildContext(UMeshComponent* Component, TMap<UTexture2D*, TUniquePtr<FIcifyGateSampler>>& Samplers,
 	FIcifyComponentContext& OutContext, FIcifyComponentReport& Report)
 {
-	const AActor* Owner = Component->GetOwner();
+	const AActor* ComponentOwner = Component->GetOwner();
 	const UEnum* SurfaceEnum = StaticEnum<EIcifySurfaceType>();
 	const int32 NumUVChannels = Icify::NumUVChannelsOf(Component);
 	const int32 NumSlots = FMath::Max(Component->GetNumMaterials(), 1);
 	OutContext.Slots.SetNum(NumSlots);
 
 	// A gutter or downpipe is itself a melt source: every drip edge it has is fed.
-	OutContext.bDripSourceMesh = (Owner && DripSourceActors.ContainsByPredicate([Owner](const TSoftObjectPtr<AActor>& Listed) { return Listed.Get() == Owner; }))
-		|| (bAutoDetectDripSources && (Icify::IsDripSource(Owner, nullptr) || Icify::IsDripSource(nullptr, Component)));
-	const bool bNoIciclesTag = Icify::HasNoIciclesTag(Owner, Component);
+	OutContext.bDripSourceMesh = (ComponentOwner && DripSourceActors.ContainsByPredicate([ComponentOwner](const TSoftObjectPtr<AActor>& Listed) { return Listed.Get() == ComponentOwner; }))
+		|| (bAutoDetectDripSources && (Icify::IsDripSource(ComponentOwner, nullptr) || Icify::IsDripSource(nullptr, Component)));
+	const bool bNoIciclesTag = Icify::HasNoIciclesTag(ComponentOwner, Component);
 	const FString NoIciclesTag = UIcifySettings::Get()->NoIciclesTag.ToString();
 
 	for (int32 Slot = 0; Slot < NumSlots; ++Slot)
@@ -1541,7 +1592,8 @@ namespace
 		// something resting just on top of it (a coping stone, roof tiles over a fascia). A roof further up keeps it dry.
 		double Height = 0.0;
 		const AActor* Cover = nullptr;
-		if (!Sky->FirstHitAbove(Point.P, Height, Cover) || (Owner && Cover == Owner) || Height <= 60.0)
+		// Its own top (a thick ledge, a globe) doesn't shelter a drip edge, but the same actor's balcony two metres up does.
+		if (!Sky->FirstHitAbove(Point.P, Height, Cover) || (Owner && Cover == Owner && Height <= 150.0) || Height <= 60.0)
 		{
 			return 1.f;
 		}
@@ -2105,10 +2157,28 @@ bool AIcifyFreezeZone::PlanIcicles(FIcifyGenerationJob& Job, const TArray<FIcify
 	};
 	TArray<FCandidate> Candidates;
 
+	// Meshes a write would skip for a custom data conflict grow nothing, so they can't use up the icicle budget or crowd
+	// out their neighbours' icicles. The same test Apply and Dry Run make.
+	auto WouldWrite = [this](const FIcifyComponentResult& MeshResult)
+	{
+		if (!IsValid(MeshResult.Component))
+		{
+			return false;
+		}
+		const FIcifyComponentRecord* Original = FindOriginalRecord(MeshResult.Component);
+		const TArray<float>& Defaults = Original ? Original->CustomData : MeshResult.Component->GetDefaultCustomPrimitiveData().Data;
+		const TArray<float>& Live = Original ? Original->LiveCustomData : MeshResult.Component->GetCustomPrimitiveData().Data;
+		return Icify::CustomDataSlotsFree(Defaults, Live, UIcifySettings::Get()->CustomPrimitiveDataIndex);
+	};
+
 	// 1. What each drip point would grow, from meltwater, heat, stamps and the density draw.
 	for (const FIcifyComponentResult& Result : Results)
 	{
-		const AActor* Owner = Result.Component ? Result.Component->GetOwner() : nullptr;
+		if (Result.DripPoints.Num() == 0 || !WouldWrite(Result))
+		{
+			continue;
+		}
+		const AActor* ComponentOwner = Result.Component ? Result.Component->GetOwner() : nullptr;
 		// Candidates sit at half the requested spacing (wider on huge meshes); the draw keeps the requested density.
 		const float Spacing = Result.DripSpacingCm > 0.f ? Result.DripSpacingCm : P.DripSpacing;
 		const float AcceptRate = FMath::Clamp(Spacing * IcicleDensity / 100.f, 0.f, 1.f);
@@ -2142,7 +2212,7 @@ bool AIcifyFreezeZone::PlanIcicles(FIcifyGenerationJob& Job, const TArray<FIcify
 			float Supply = 1.f;
 			if (bIciclesNeedMeltwater && !Point.bDripSource)
 			{
-				Supply = FMath::Max(SkySupply(P.Sky, Point, Owner), MeltSupply(P, Point.P));
+				Supply = FMath::Max(SkySupply(P.Sky, Point, ComponentOwner), MeltSupply(P, Point.P));
 			}
 			Supply = FMath::Max(Supply, FMath::Min(StampAdd, 1.f));
 			if (Supply < 0.05f)
@@ -2404,7 +2474,7 @@ void AIcifyFreezeZone::BuildIcicles(const FIcifyGenerationJob& Job, const TSet<i
 	}
 }
 
-UMaterialInterface* AIcifyFreezeZone::ResolveIcicleMaterial(UProceduralMeshComponent* Owner)
+UMaterialInterface* AIcifyFreezeZone::ResolveIcicleMaterial(UProceduralMeshComponent* IcicleComponent)
 {
 	UMaterialInterface* Base = IcicleMaterial ? IcicleMaterial.Get() : UIcifySettings::Get()->IcicleMaterial.LoadSynchronous();
 	if (!Base)
@@ -2418,8 +2488,8 @@ UMaterialInterface* AIcifyFreezeZone::ResolveIcicleMaterial(UProceduralMeshCompo
 	}
 
 	// The zone's palette tints its own icicles through an instance that lives inside the icicle component.
-	const FName Name = MakeUniqueObjectName(Owner, UMaterialInstanceConstant::StaticClass(), TEXT("IcifyIcicleMI"));
-	UMaterialInstanceConstant* Instance = NewObject<UMaterialInstanceConstant>(Owner, Name, RF_Transactional);
+	const FName Name = MakeUniqueObjectName(IcicleComponent, UMaterialInstanceConstant::StaticClass(), TEXT("IcifyIcicleMI"));
+	UMaterialInstanceConstant* Instance = NewObject<UMaterialInstanceConstant>(IcicleComponent, Name, RF_Transactional);
 	Instance->SetParentEditorOnly(Base);
 	if (Palette.bOverrideIceTint)
 	{
