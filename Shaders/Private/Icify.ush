@@ -1,0 +1,567 @@
+// Copyright Fallen Signal Studios. All Rights Reserved.
+// Icify ice shading.
+//
+// Included by the custom nodes in /Icify/Materials/MF_IcifyFrost, M_IcifyMaskDebug and M_IcifyIcicle.
+// A freeze zone bakes four masks into vertex colour or a per-instance mask texture; this file turns them into frost
+// crystals, snow, clear glaze and black ice at the zone's physical feature scale.
+//
+//   Masks.r = frost   Masks.g = snow   Masks.b = glaze   Masks.a = black ice
+//   MaskMode: 701 = vertex colour, 702 = mask texture; every other value is inactive.
+//   Generated graphs multiply this signed CPD value by Icify Active, a non-CPD scalar that defaults to 0. Only material
+//   instances owned by a zone set it to 1.
+//   Surface: 0 = stone, 1 = metal, 2 = glass
+//
+// Icicles (M_IcifyIcicle) read their vertex colour: r = frost, g = thickness (radius / 2.5 cm), b = 0 at the root to 1
+// at the tip, a = per-icicle random. UV0.x runs around the icicle (0..1) and UV0.y is centimetres down it.
+//
+// Nothing here uses ddx/ddy, so every function also works for Nanite compute shading.
+
+#pragma once
+
+uint IcifyHashU(uint X)
+{
+	X ^= X >> 16;
+	X *= 0x7feb352du;
+	X ^= X >> 15;
+	X *= 0x846ca68bu;
+	X ^= X >> 16;
+	return X;
+}
+
+uint IcifyHashCell(int3 C, uint Seed)
+{
+	uint H = IcifyHashU(asuint(C.z) * 0xcb1ab31fu ^ Seed);
+	H = IcifyHashU(asuint(C.y) * 0xd8163841u ^ H);
+	return IcifyHashU(asuint(C.x) * 0x8da6b343u ^ H);
+}
+
+float IcifyHash3(int3 C, uint Seed)
+{
+	return float(IcifyHashCell(C, Seed) & 0x00FFFFFFu) * (1.0 / 16777216.0);
+}
+
+// Three 0..1 random numbers from the low 30 bits of one hash.
+float3 IcifyRandom3(uint H)
+{
+	return float3(uint3(H, H >> 10, H >> 20) & 1023u) * (1.0 / 1023.0);
+}
+
+float IcifyValueNoise(float3 P, uint Seed)
+{
+	const float3 I = floor(P);
+	const float3 F = P - I;
+	const float3 U = F * F * (3.0 - 2.0 * F);
+	const int3 C = int3(I);
+
+	const float N000 = IcifyHash3(C + int3(0, 0, 0), Seed);
+	const float N100 = IcifyHash3(C + int3(1, 0, 0), Seed);
+	const float N010 = IcifyHash3(C + int3(0, 1, 0), Seed);
+	const float N110 = IcifyHash3(C + int3(1, 1, 0), Seed);
+	const float N001 = IcifyHash3(C + int3(0, 0, 1), Seed);
+	const float N101 = IcifyHash3(C + int3(1, 0, 1), Seed);
+	const float N011 = IcifyHash3(C + int3(0, 1, 1), Seed);
+	const float N111 = IcifyHash3(C + int3(1, 1, 1), Seed);
+
+	const float A = lerp(lerp(N000, N100, U.x), lerp(N010, N110, U.x), U.y);
+	const float B = lerp(lerp(N001, N101, U.x), lerp(N011, N111, U.x), U.y);
+	return lerp(A, B, U.z);
+}
+
+float IcifyFbm(float3 P, uint Seed)
+{
+	float Sum = 0.0;
+	float Amp = 0.5;
+	float Norm = 0.0;
+	for (int Octave = 0; Octave < 3; ++Octave)
+	{
+		Sum += IcifyValueNoise(P, Seed + uint(Octave) * 101u) * Amp;
+		Norm += Amp;
+		P = P * 2.03 + 17.17;
+		Amp *= 0.5;
+	}
+	return Sum / Norm;
+}
+
+// Thin crests where the noise crosses its middle: a network of needle-like lines.
+float IcifyRidged(float3 P, uint Seed)
+{
+	const float Crest = 1.0 - abs(2.0 * IcifyValueNoise(P, Seed) - 1.0);
+	const float Sharp = Crest * Crest;
+	return Sharp * Sharp;
+}
+
+// One simplex corner's needles: noise crests stretched along a random direction, laid flat on the surface. Rel is the
+// point relative to the corner. Needles pointing almost straight out of the surface fade, as they would look end-on.
+float IcifyNeedleCorner(float3 Corner, float3 Rel, float3 N, uint Seed)
+{
+	const float Window = max(0.6 - dot(Rel, Rel), 0.0);
+	const float Weight = smoothstep(0.02, 0.15, Window * Window);
+	if (Weight <= 0.0)
+	{
+		return 0.0;
+	}
+	const uint H = IcifyHashCell(int3(Corner), Seed);
+	const float3 R = IcifyRandom3(H);
+	const float Z = R.x * 2.0 - 1.0;
+	const float Phi = R.y * 6.2831853;
+	const float3 Dir = float3(sqrt(saturate(1.0 - Z * Z)) * float2(cos(Phi), sin(Phi)), Z);
+	const float3 Flat = Dir - N * dot(Dir, N);
+	const float FlatLength = length(Flat);
+	const float3 D = Flat / max(FlatLength, 0.0001);
+	const float Amount = (0.45 + 0.55 * R.z) * saturate(FlatLength * 3.0) * Weight;
+	const float3 Shift = IcifyRandom3(IcifyHashU(H ^ 0x9e3779b9u)) * 37.0;
+	// 8 crests across the needles for every 0.4 along them.
+	const float3 Q = Rel * 8.0 - D * (dot(Rel, D) * 7.6) + Shift;
+	const float Crest = 1.0 - abs(2.0 * IcifyValueNoise(Q, Seed + 7u) - 1.0);
+	const float Crest2 = Crest * Crest;
+	return Crest2 * Crest2 * Crest2 * Amount;
+}
+
+// Hoarfrost needles. Every corner of a simplex lattice (three crystal cells across) grows needles in its own
+// direction; the simplex kernels blend the corners, so the needle domains meet without seams on any surface.
+// P is in crystal cells and N is the surface normal. Averages 0.228.
+float IcifyFrostNeedles(float3 P, float3 N, uint Seed)
+{
+	const float3 X = P * (1.0 / 3.0);
+	const float3 I = floor(X + (X.x + X.y + X.z) * (1.0 / 3.0));
+	const float3 X0 = X - I + (I.x + I.y + I.z) * (1.0 / 6.0);
+	const float3 G = step(X0.yzx, X0.xyz);
+	const float3 L = 1.0 - G;
+	const float3 I1 = min(G, L.zxy);
+	const float3 I2 = max(G, L.zxy);
+	float Needles = IcifyNeedleCorner(I, X0, N, Seed);
+	Needles = max(Needles, IcifyNeedleCorner(I + I1, X0 - I1 + (1.0 / 6.0), N, Seed));
+	Needles = max(Needles, IcifyNeedleCorner(I + I2, X0 - I2 + (2.0 / 6.0), N, Seed));
+	Needles = max(Needles, IcifyNeedleCorner(I + 1.0, X0 - 0.5, N, Seed));
+	return saturate(Needles);
+}
+
+// Sugary grain between the needles: two octaves on turned lattices, so it shows no grid. Averages 0.5.
+float IcifyFrostGrain(float3 P, float Footprint, uint Seed)
+{
+	const float CoarseFade = 1.0 - smoothstep(0.12, 0.4, Footprint);
+	const float FineFade = 1.0 - smoothstep(0.04, 0.12, Footprint);
+	float Grain = 0.5;
+	if (CoarseFade > 0.0)
+	{
+		const float3 A = float3(dot(P, float3(0.8, -0.6, 0.0)), dot(P, float3(0.36, 0.48, -0.8)), dot(P, float3(0.48, 0.64, 0.6)));
+		Grain += (IcifyValueNoise(A * 4.0, Seed + 9u) - 0.5) * 0.6 * CoarseFade;
+	}
+	if (FineFade > 0.0)
+	{
+		const float3 B = float3(dot(P, float3(0.8, 0.36, 0.48)), dot(P, float3(-0.6, 0.48, 0.64)), dot(P, float3(0.0, -0.8, 0.6)));
+		Grain += (IcifyValueNoise(B * 9.3, Seed + 15u) - 0.5) * 0.4 * FineFade;
+	}
+	return saturate((Grain - 0.5) * 2.2 + 0.5);
+}
+
+// Hoarfrost: needles lying every which way over fine sugary grain. Footprint is the size of a pixel in crystal cells.
+// Detail finer than a pixel fades to its average, so frost never shimmers in the distance. Returns (crystals, needles);
+// the crystals average 0.445.
+float2 IcifyFrostCrystals(float3 P, float3 N, float Footprint, uint Seed)
+{
+	const float NeedleFade = 1.0 - smoothstep(0.06, 0.18, Footprint);
+	float Needles = 0.228;
+	if (NeedleFade > 0.0)
+	{
+		Needles = lerp(0.228, IcifyFrostNeedles(P, N, Seed), NeedleFade);
+	}
+	const float Grain = IcifyFrostGrain(P, Footprint, Seed);
+	return float2(saturate(Grain * 0.55 + Needles * 0.75), Needles);
+}
+
+// Fern frost on glass: warped trunks with branches and leaves growing off them.
+float IcifyFernFrost(float3 P, uint Seed)
+{
+	const float3 Warp = float3(IcifyValueNoise(P * 0.6, Seed + 11u), IcifyValueNoise(P * 0.6 + 7.1, Seed + 13u),
+		IcifyValueNoise(P * 0.6 + 3.7, Seed + 17u)) - 0.5;
+	const float3 Q = P + Warp * 1.6;
+	const float Trunk = IcifyRidged(Q * 0.8, Seed + 19u);
+	const float Branch = IcifyRidged(Q * 2.7 + Trunk * 0.9, Seed + 23u);
+	const float Leaf = IcifyRidged(Q * 6.1 + Branch * 0.7, Seed + 29u);
+	return saturate(Trunk * 0.6 + Branch * 0.45 + Leaf * 0.3);
+}
+
+// Keep these exact integers in sync with IcifyTypes.h. Ordinary user CPD values must never activate wrapped materials,
+// even when vertex colours are white.
+bool IcifyHasValidMaskMode(float MaskMode)
+{
+	return MaskMode == 701.0 || MaskMode == 702.0;
+}
+
+float4 IcifySelectMasks(float MaskMode, float4 VertexMasks, float4 TextureMasks)
+{
+	if (MaskMode == 702.0)
+	{
+		return TextureMasks;
+	}
+	if (MaskMode == 701.0)
+	{
+		return VertexMasks;
+	}
+	return float4(0.0, 0.0, 0.0, 0.0);
+}
+
+int IcifySurfaceId(float SurfaceFromZone, float SurfaceOverride)
+{
+	const float Surface = SurfaceOverride >= 0.0 ? SurfaceOverride : SurfaceFromZone;
+	return (int)round(Surface);
+}
+
+float3 IcifyNoisePos(float3 WorldPos, float FeatureScaleCm, float SeedOffset)
+{
+	const float Scale = FeatureScaleCm > 0.5 ? FeatureScaleCm : 20.0;
+	return WorldPos / Scale + SeedOffset;
+}
+
+// Lifts (Contrast > 1) or sinks (< 1) faint ice without changing fully iced or untouched areas. Exactly unchanged at 1.
+float4 IcifyContrast(float4 Masks, float Contrast)
+{
+	if (Contrast == 1.0 || Contrast <= 0.0)
+	{
+		return Masks;
+	}
+	return pow(saturate(Masks), 1.0 / Contrast);
+}
+
+// Art direction controls, independent of the masks. The defaults give the standard look.
+struct FIcifyArt
+{
+	float FeatureScaleCm; // the mesh's feature scale, so crystal size can be given in cm
+	float CrystalCm;      // frost crystal size; 0 = a sixth of the feature scale
+	float FernFrost;      // 0..1, how much frost on glass grows into fern patterns
+	float SnowBreakup;    // 0 = clean snow cover, 1 = patchy snow with bare gaps
+	float Sparkle;        // 0..1, glints in frost and snow
+	float ViewDistance;   // cm from the camera; glints and fine crystals fade with distance so they never shimmer
+};
+
+// Roughly the angle one pixel covers, in radians (1080p to 1440p at a 90 degree field of view). Turns the view distance
+// into a pixel footprint for fading detail without screen-space derivatives.
+static const float IcifyPixelAngle = 0.0012;
+
+// How much IcifyLayers works out: everything for colour, less for the normal pass and for the relief height samples.
+static const int IcifyDetailHeight = 0; // snow and glaze cover only
+static const int IcifyDetailNormal = 1; // + frost cover, black ice and glints
+static const int IcifyDetailFull = 2;   // + frost crystals and snow shading
+
+FIcifyArt IcifyMakeArt(float FeatureScaleCm, float CrystalCm, float FernFrost, float SnowBreakup, float Sparkle, float ViewDistance)
+{
+	FIcifyArt Art;
+	Art.FeatureScaleCm = FeatureScaleCm > 0.5 ? FeatureScaleCm : 20.0;
+	Art.CrystalCm = max(CrystalCm, 0.0);
+	Art.FernFrost = saturate(FernFrost);
+	Art.SnowBreakup = saturate(SnowBreakup);
+	Art.Sparkle = saturate(Sparkle);
+	Art.ViewDistance = max(ViewDistance, 0.0);
+	return Art;
+}
+
+FIcifyArt IcifyDefaultArt()
+{
+	return IcifyMakeArt(20.0, 0.0, 1.0, 0.5, 0.5, 0.0);
+}
+
+struct FIcifyLayers
+{
+	float Frost;     // frost cover, 0..1
+	float Crystals;  // crystal detail inside the frost, 0..1
+	float Needles;   // the needle crests on their own, glossier than the grain between them
+	float Snow;
+	float SnowShade; // gentle brightness variation across the snow
+	float Glaze;
+	float Black;     // black ice
+	float Glint;     // 0..1, a glinting facet here
+	float2 GlintTilt;
+};
+
+// Where each layer actually shows. The masks say how much ice belongs on a surface; noise at the feature scale
+// decides its exact edges, so frost grows in patches, snow breaks up and black ice forms in sheets.
+FIcifyLayers IcifyLayers(float4 Masks, float3 P, float3 WorldPos, float3 WorldNormal, int SurfaceId, FIcifyArt Art, int Detail)
+{
+	const uint Seed = 1709u;
+	FIcifyLayers L;
+	L.Frost = 0.0;
+	L.Crystals = 0.0;
+	L.Needles = 0.0;
+	L.Snow = 0.0;
+	L.SnowShade = 0.5;
+	L.Glaze = 0.0;
+	L.Black = 0.0;
+	L.Glint = 0.0;
+	L.GlintTilt = float2(0.0, 0.0);
+
+	// Frost starts in patches (where the noise is low) and joins up into a full coat as its mask rises. The crystals
+	// feather its edges, so needles reach out past them.
+	if (Detail >= IcifyDetailNormal && Masks.r > 0.005)
+	{
+		const float FrostT = 0.08 + 0.6 * IcifyFbm(P * 1.3, Seed + 3u);
+		const float Reach = Masks.r * 1.1;
+		// The crystals' averages, for passes that don't need the detail.
+		float2 Crystal = float2(0.445, 0.228);
+		if (Detail >= IcifyDetailFull && Reach > FrostT - 0.4)
+		{
+			const float CrystalCm = Art.CrystalCm > 0.0 ? Art.CrystalCm : Art.FeatureScaleCm / 6.0;
+			const float3 CrystalP = P * (Art.FeatureScaleCm / CrystalCm);
+			const float Footprint = Art.ViewDistance * IcifyPixelAngle / CrystalCm;
+			const float3 N = WorldNormal * rsqrt(max(dot(WorldNormal, WorldNormal), 0.000001));
+			Crystal = IcifyFrostCrystals(CrystalP, N, Footprint, Seed + 5u);
+			if (SurfaceId == 2 && Art.FernFrost > 0.0)
+			{
+				const float FernFade = 1.0 - smoothstep(0.1, 0.3, Footprint);
+				float Fern = 0.479;
+				if (FernFade > 0.0)
+				{
+					Fern = lerp(0.479, IcifyFernFrost(CrystalP * 0.5, Seed + 7u), FernFade);
+				}
+				Crystal.x = lerp(Crystal.x, Fern, Art.FernFrost);
+			}
+		}
+		L.Frost = smoothstep(FrostT - 0.15, FrostT + 0.15, Reach + (Crystal.x - 0.445) * 0.3);
+		L.Crystals = Crystal.x;
+		L.Needles = Crystal.y;
+	}
+
+	// Snow: a clean cover at Snow Breakup 0, patches with bare gaps towards 1. Fine noise keeps the patch edges crisp.
+	if (Masks.g > 0.005)
+	{
+		const float Patches = 0.12 + 0.55 * IcifyFbm(P * 0.6, Seed + 11u) + 0.12 * (IcifyValueNoise(P * 4.0, Seed + 31u) - 0.5);
+		const float SnowT = lerp(0.04, Patches, Art.SnowBreakup);
+		L.Snow = smoothstep(SnowT - 0.006, SnowT + 0.006, Masks.g);
+		if (Detail >= IcifyDetailFull)
+		{
+			L.SnowShade = IcifyFbm(P * 1.7, Seed + 13u);
+		}
+	}
+
+	// Glaze is a continuous coat; the drips are already in its mask.
+	if (Masks.b > 0.0)
+	{
+		L.Glaze = Masks.b * lerp(0.85, 1.0, IcifyValueNoise(P * 0.9, Seed + 17u));
+	}
+
+	if (Detail < IcifyDetailNormal)
+	{
+		return L;
+	}
+
+	// Black ice in sheets with clean edges.
+	if (Masks.a > 0.005)
+	{
+		const float BlackT = 0.06 + 0.4 * IcifyFbm(P * 0.45, Seed + 19u);
+		L.Black = smoothstep(BlackT - 0.012, BlackT + 0.012, Masks.a);
+	}
+
+	// Glints: small round crystal facets, one in some of the centimetre-scale cells, tilted towards a random direction
+	// and glossy. Each sits far enough inside its cell that it never meets the cell's edge.
+	const float Sparkling = saturate(L.Snow + L.Frost * 0.8) * Art.Sparkle * (1.0 - smoothstep(600.0, 2400.0, Art.ViewDistance));
+	if (Sparkling > 0.0)
+	{
+		const float CellCm = max(Art.FeatureScaleCm * 0.04, 0.4);
+		const float3 G = WorldPos / CellCm;
+		const float3 Cell = floor(G);
+		const uint H = IcifyHashCell(int3(Cell), Seed + 23u);
+		const float3 R = IcifyRandom3(H);
+		if (R.x < 0.35)
+		{
+			const float3 Center = Cell + 0.5 + (IcifyRandom3(IcifyHashU(H ^ 0x2545f491u)) - 0.5) * 0.4;
+			L.Glint = Sparkling * (1.0 - smoothstep(0.12, 0.3, length(G - Center)));
+			const float Angle = R.y * 6.2831853;
+			L.GlintTilt = float2(cos(Angle), sin(Angle));
+		}
+	}
+	return L;
+}
+
+struct FIcifyResult
+{
+	float3 BaseColor;
+	float Roughness;
+	float Metallic;
+};
+
+FIcifyResult IcifyEvaluate(
+	float3 BaseColor, float Roughness, float Metallic,
+	float MaskMode, float4 VertexMasks, float4 TextureMasks,
+	float3 WorldPos, float3 WorldNormal,
+	float SurfaceFromZone, float SurfaceOverride,
+	float FeatureScaleCm, float SeedOffset,
+	float3 FrostColor, float3 SnowColor, float3 IceTint,
+	float Strength, float4 LayerStrength, FIcifyArt Art)
+{
+	FIcifyResult R;
+	R.BaseColor = BaseColor;
+	R.Roughness = Roughness;
+	R.Metallic = Metallic;
+
+	// Inactive: the material responds exactly as it would without Icify.
+	if (!IcifyHasValidMaskMode(MaskMode))
+	{
+		return R;
+	}
+
+	const float4 Masks = saturate(IcifySelectMasks(MaskMode, VertexMasks, TextureMasks) * Strength * LayerStrength);
+	if (max(max(Masks.r, Masks.g), max(Masks.b, Masks.a)) <= 0.005)
+	{
+		return R;
+	}
+	const int SurfaceId = IcifySurfaceId(SurfaceFromZone, SurfaceOverride);
+	const float3 P = IcifyNoisePos(WorldPos, FeatureScaleCm, SeedOffset);
+	const FIcifyLayers L = IcifyLayers(Masks, P, WorldPos, WorldNormal, SurfaceId, Art, IcifyDetailFull);
+
+	// Black ice: smooth, dark and clear, with the floor showing through it.
+	R.BaseColor = lerp(R.BaseColor, R.BaseColor * 0.42 + IceTint * 0.015, L.Black);
+	R.Roughness = lerp(R.Roughness, 0.05, L.Black);
+	R.Metallic = lerp(R.Metallic, 0.0, L.Black);
+
+	// Glaze: a clear coat of ice. The surface reads darker and richer through it, faintly blue where it's thick.
+	const float3 Through = R.BaseColor * lerp(float3(1.0, 1.0, 1.0), IceTint * 1.25, 0.35) * 0.78;
+	R.BaseColor = lerp(R.BaseColor, Through, L.Glaze);
+	R.Roughness = lerp(R.Roughness, 0.07, L.Glaze);
+	R.Metallic = lerp(R.Metallic, R.Metallic * 0.35, L.Glaze);
+
+	// Frost: white crystal fur. Thin frost is a dusting, with the surface showing between the crystals; it closes into
+	// a solid coat as the mask rises. The needle crests are glossier than the grain between them.
+	const float Coat = saturate(Masks.r * 1.4);
+	const float FrostAlpha = L.Frost * lerp(0.3 + 0.7 * L.Crystals, 1.0, Coat);
+	R.BaseColor = lerp(R.BaseColor, FrostColor * lerp(0.84, 1.04, L.Crystals), FrostAlpha);
+	R.Roughness = lerp(R.Roughness, lerp(0.72, 0.47, L.Needles), FrostAlpha);
+	R.Metallic = lerp(R.Metallic, 0.0, FrostAlpha);
+
+	// Snow on top of everything.
+	R.BaseColor = lerp(R.BaseColor, SnowColor * lerp(0.9, 1.0, L.SnowShade), L.Snow);
+	R.Roughness = lerp(R.Roughness, 0.82, L.Snow);
+	R.Metallic = lerp(R.Metallic, 0.0, L.Snow);
+
+	// Glinting facets: glossy, so they catch the light at their own angle (the normal output tilts them).
+	R.Roughness = lerp(R.Roughness, 0.1, L.Glint);
+
+	R.BaseColor = saturate(R.BaseColor);
+	R.Roughness = saturate(R.Roughness);
+	R.Metallic = saturate(R.Metallic);
+	return R;
+}
+
+// Relief height: drifted snow stands proud of the surface and glaze ripples gently along its drips. Frost crystals are
+// far finer than the relief samples, so they show through their colour, gloss and glints instead.
+float IcifyReliefHeight(float4 Masks, float3 P, float3 WorldPos, float3 WorldNormal, int SurfaceId, FIcifyArt Art)
+{
+	const FIcifyLayers L = IcifyLayers(Masks, P, WorldPos, WorldNormal, SurfaceId, Art, IcifyDetailHeight);
+	float Height = 0.0;
+	if (L.Snow > 0.0)
+	{
+		Height += L.Snow * (0.55 + 0.45 * IcifyFbm(P * 0.7, 1201u));
+	}
+	if (L.Glaze > 0.0 && L.Snow < 1.0)
+	{
+		const float Ripple = sin(P.z * 9.0 + IcifyValueNoise(P * float3(2.0, 2.0, 0.3), 1213u) * 5.0);
+		Height += L.Glaze * (1.0 - L.Snow) * 0.04 * Ripple;
+	}
+	return Height;
+}
+
+// The input tangent-space normal is flattened where snow and ice fill the surface's own detail, then given the ice's
+// relief and glints. It comes back unchanged on inactive meshes and wherever there is no ice.
+float3 IcifyReliefNormal(
+	float3 NormalTS, float Relief,
+	float MaskMode, float4 VertexMasks, float4 TextureMasks,
+	float3 WorldPos, float3 WorldNormal, float3 TangentWS, float3 BitangentWS,
+	float FeatureScaleCm, float SeedOffset, float SurfaceFromZone, float SurfaceOverride,
+	float Strength, float4 LayerStrength, FIcifyArt Art)
+{
+	if (!IcifyHasValidMaskMode(MaskMode))
+	{
+		return NormalTS;
+	}
+	const float4 Masks = saturate(IcifySelectMasks(MaskMode, VertexMasks, TextureMasks) * Strength * LayerStrength);
+	if (max(max(Masks.r, Masks.g), max(Masks.b, Masks.a)) <= 0.005)
+	{
+		return NormalTS;
+	}
+
+	const int SurfaceId = IcifySurfaceId(SurfaceFromZone, SurfaceOverride);
+	const float3 P = IcifyNoisePos(WorldPos, FeatureScaleCm, SeedOffset);
+	const FIcifyLayers L = IcifyLayers(Masks, P, WorldPos, WorldNormal, SurfaceId, Art, IcifyDetailNormal);
+
+	const float Flatten = saturate(L.Snow * 0.9 + L.Black * 0.85 + L.Glaze * 0.6 + L.Frost * 0.25);
+	float3 N = normalize(lerp(NormalTS, float3(0.0, 0.0, 1.0), Flatten));
+
+	// Only snow and glaze have relief, so most frost and black ice skips the three height samples.
+	if (Relief > 0.0 && (Masks.g > 0.005 || Masks.b > 0.0))
+	{
+		const float Step = 0.03;
+		const float H0 = IcifyReliefHeight(Masks, P, WorldPos, WorldNormal, SurfaceId, Art);
+		const float HT = IcifyReliefHeight(Masks, P + normalize(TangentWS) * Step, WorldPos, WorldNormal, SurfaceId, Art);
+		const float HB = IcifyReliefHeight(Masks, P + normalize(BitangentWS) * Step, WorldPos, WorldNormal, SurfaceId, Art);
+		const float2 Slope = float2(HT - H0, HB - H0) / Step;
+		N.xy -= Slope * Relief * 0.05;
+	}
+
+	N.xy += L.GlintTilt * (L.Glint * 0.6);
+	return normalize(N);
+}
+
+// Channels: 0 all (frost red, snow green, glaze blue, black ice yellow), 1-4 one layer as grey.
+float3 IcifyMaskDebug(float MaskMode, float4 VertexMasks, float4 TextureMasks, float Channel)
+{
+	const float4 Masks = IcifySelectMasks(MaskMode, VertexMasks, TextureMasks);
+	const int C = (int)round(Channel);
+	if (C == 1) return Masks.rrr;
+	if (C == 2) return Masks.ggg;
+	if (C == 3) return Masks.bbb;
+	if (C == 4) return Masks.aaa;
+	return saturate(float3(Masks.r, Masks.g, Masks.b) + Masks.a * float3(0.6, 0.6, 0.0));
+}
+
+// ---------------------------------------------------------------- Icicles
+
+struct FIcifyIcicle
+{
+	float3 BaseColor;
+	float Roughness;
+	float Specular;
+	float Opacity;          // subsurface opacity: low lets more light through
+	float3 SubsurfaceColor;
+};
+
+FIcifyIcicle IcifyIcicleShade(float4 VertexColor, float2 UV, float3 WorldPos, float3 IceTint, float3 FrostColor, float Clarity)
+{
+	const float Frost = saturate(VertexColor.r);
+	const float Thickness = saturate(VertexColor.g);
+	const float Along = saturate(VertexColor.b);
+	const float Random = VertexColor.a;
+	const float Clear = saturate(Clarity);
+
+	// Light goes into clear ice and scatters back out: bluer and deeper where it's thick, clearest at the tip.
+	const float Deep = saturate(Thickness * 0.8 + (1.0 - Along) * 0.3);
+	// Milky streaks run down the icicle where air froze into it.
+	const float Cloud = IcifyValueNoise(float3(UV.x * 6.0, UV.y * 0.35, Random * 17.0 + WorldPos.z * 0.001), 401u);
+	const float Milky = saturate((Cloud - 0.35) * 1.6) * (1.0 - Clear) * (0.4 + 0.6 * Deep);
+	const float3 Ice = IceTint * lerp(0.62, 0.36, Deep) * lerp(0.92, 1.08, Random);
+
+	// Rime: frost on the icicle, heaviest near the root.
+	const float RimeNoise = IcifyValueNoise(float3(UV.x * 9.0, UV.y * 0.8, Random * 31.0), 409u);
+	const float Rime = saturate(Frost * (1.2 - Along) * lerp(0.6, 1.2, RimeNoise));
+
+	FIcifyIcicle I;
+	I.BaseColor = saturate(lerp(lerp(Ice, float3(0.78, 0.84, 0.88), Milky), FrostColor * 0.9, Rime));
+	I.Roughness = saturate(lerp(lerp(0.03, 0.1, Milky), 0.6, Rime));
+	// Ice reflects less than the default dielectric (its index is about 1.31).
+	I.Specular = lerp(0.25, 0.5, Rime);
+	I.Opacity = saturate(lerp(lerp(0.12, 0.5, Deep) * lerp(1.0, 0.6, Clear) + Milky * 0.3, 0.9, Rime));
+	I.SubsurfaceColor = saturate(lerp(IceTint, FrostColor, Rime * 0.5));
+	return I;
+}
+
+// The bulges each drip leaves as it freezes run around the icicle, so the bumps follow its length (UV0.y).
+float3 IcifyIcicleNormal(float4 VertexColor, float2 UV, float RippleCm, float Ripples)
+{
+	const float Random = VertexColor.a;
+	const float Wave = max(RippleCm, 0.2);
+	const float Wobble = (IcifyValueNoise(float3(UV.x * 4.0, UV.y * 0.5 / Wave, Random * 9.0), 419u) - 0.5) * 3.0;
+	const float Phase = UV.y / Wave * 6.2831853 + Random * 40.0 + Wobble;
+	// Rime hides the ripples.
+	const float Amount = saturate(Ripples) * (1.0 - saturate(VertexColor.r) * 0.7);
+	const float Slope = cos(Phase) * 0.35 * Amount;
+	const float Micro = (IcifyValueNoise(float3(UV.x * 23.0, UV.y * 3.1, Random * 5.0), 421u) - 0.5) * 0.25 * Amount;
+	return normalize(float3(Micro, -Slope, 1.0));
+}

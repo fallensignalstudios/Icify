@@ -9,3 +9,4 @@ DerivedDataCache/
 *.VC.db
 .vs/
 .idea/
+__pycache__/
